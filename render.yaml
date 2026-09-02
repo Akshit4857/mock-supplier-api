@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: mock-supplier-api
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: API_BASE_URL
+        sync: false   # Render dashboard se set karo deploy ke baad
