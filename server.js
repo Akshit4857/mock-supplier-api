@@ -2,85 +2,12 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
-const http = require('http');
-const crypto = require('crypto');
-const sharp = require('sharp');
 
 const app = express();
 app.use(cors());
 
-// Enable trust proxy so Render/Cloudflare headers are accurate
+// Enable trust proxy
 app.set('trust proxy', 1);
-
-// ── Image cache directory ────────────────────────────────────────────────────
-const CACHE_DIR = path.join(__dirname, 'image-cache');
-if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
-
-function urlToFilename(url) {
-  const hash = crypto.createHash('md5').update(url).digest('hex');
-  return hash + '.webp';
-}
-
-function fetchBuffer(url) {
-  return new Promise((resolve, reject) => {
-    const lib = url.startsWith('https') ? https : http;
-    const req = lib.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetchBuffer(res.headers.location).then(resolve).catch(reject);
-      }
-      if (res.statusCode !== 200) {
-        return reject(new Error(`Failed to fetch image status: ${res.statusCode}`));
-      }
-      const chunks = [];
-      res.on('data', c => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks)));
-      res.on('error', reject);
-    });
-    req.on('error', reject);
-    req.setTimeout(10000, () => {
-      req.destroy();
-      reject(new Error('Image fetch timeout'));
-    });
-  });
-}
-
-// ── /api/img — on-demand WebP proxy ─────────────────────────────────────────
-app.get('/api/img', async (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).json({ error: 'Missing url param' });
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-
-  const filename = urlToFilename(url);
-  const cachePath = path.join(CACHE_DIR, filename);
-
-  // Serve from cache if available
-  if (fs.existsSync(cachePath)) {
-    res.setHeader('Content-Type', 'image/webp');
-    res.setHeader('X-Cache', 'HIT');
-    return fs.createReadStream(cachePath).pipe(res);
-  }
-
-  try {
-    const buf = await fetchBuffer(url);
-    const webpBuf = await sharp(buf)
-      .webp({ quality: 80, effort: 3 })
-      .toBuffer();
-
-    // Write to cache (fire-and-forget)
-    fs.writeFile(cachePath, webpBuf, () => {});
-
-    res.setHeader('Content-Type', 'image/webp');
-    res.setHeader('X-Cache', 'MISS');
-    res.send(webpBuf);
-  } catch (err) {
-    console.error('Image proxy conversion error, redirecting to original:', err.message);
-    // Fallback: direct redirect to original CloudFront image so it ALWAYS displays!
-    res.redirect(url);
-  }
-});
 
 // ── Load data ────────────────────────────────────────────────────────────────
 const catalogFile = path.join(__dirname, 'laskers-ring-catalog.json');
@@ -113,9 +40,9 @@ function getMetalString(metal, color) {
   return '14k White Gold';
 }
 
-// ── Pre-process catalog data into raw templates ──────────────────────────────
+// ── Pre-process catalog data (Direct original CloudFront URLs) ────────────────
 console.log('Processing JSON data for API...');
-const rawSettings = [];
+const settingsResults = [];
 
 if (rawData.ring_groups) {
   for (const [groupId, group] of Object.entries(rawData.ring_groups)) {
@@ -143,11 +70,12 @@ if (rawData.ring_groups) {
         metalMap[metalStr] = {
           metal: metalStr,
           priceCents: (r.price || group.minPrice || 1000) * 100,
-          rawImages: {}
+          images: {}
         };
       }
       if (r.defaultShape) {
-        metalMap[metalStr].rawImages[r.defaultShape.toLowerCase()] = {
+        // Direct original CloudFront CDN PNG URLs
+        metalMap[metalStr].images[r.defaultShape.toLowerCase()] = {
           images: r.images || [],
           hoverImage: r.hoverImage || ''
         };
@@ -162,7 +90,7 @@ if (rawData.ring_groups) {
       ? group.style.join(', ')
       : (group.style || (Array.isArray(firstRing.style) ? firstRing.style.join(', ') : 'Solitaire'));
 
-    rawSettings.push({
+    settingsResults.push({
       id: groupId,
       slug: groupId,
       title,
@@ -177,17 +105,7 @@ if (rawData.ring_groups) {
     });
   }
 }
-console.log(`Pre-processed ${rawSettings.length} ring groups successfully.`);
-
-// ── Helper to resolve dynamic base URL per request ──────────────────────────
-function getBaseUrl(req) {
-  if (process.env.API_BASE_URL && !process.env.API_BASE_URL.includes('localhost')) {
-    return process.env.API_BASE_URL.replace(/\/$/, '');
-  }
-  const host = req.headers['x-forwarded-host'] || req.get('host');
-  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-  return `${protocol}://${host}`;
-}
+console.log(`Pre-processed ${settingsResults.length} ring groups successfully.`);
 
 // ── API routes ───────────────────────────────────────────────────────────────
 app.get('/api/settings', (req, res) => {
@@ -195,28 +113,7 @@ app.get('/api/settings', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const { style, metal, shape } = req.query;
 
-  const baseUrl = getBaseUrl(req);
-
-  // Dynamically map image URLs with the guaranteed correct live base URL
-  const results = rawSettings.map(setting => ({
-    ...setting,
-    metalOptions: setting.metalOptions.map(opt => {
-      const images = {};
-      for (const [sKey, sVal] of Object.entries(opt.rawImages || {})) {
-        images[sKey] = {
-          images: (sVal.images || []).map(u => `${baseUrl}/api/img?url=${encodeURIComponent(u)}`),
-          hoverImage: sVal.hoverImage ? `${baseUrl}/api/img?url=${encodeURIComponent(sVal.hoverImage)}` : ''
-        };
-      }
-      return {
-        metal: opt.metal,
-        priceCents: opt.priceCents,
-        images
-      };
-    })
-  }));
-
-  let filtered = results;
+  let filtered = settingsResults;
   if (style) filtered = filtered.filter(s => s.style.toLowerCase().includes(style.toLowerCase()));
   if (metal) filtered = filtered.filter(s => s.metalOptions.some(m => m.metal.toLowerCase().includes(metal.toLowerCase())));
   if (shape) filtered = filtered.filter(s => s.compatibleShapes.some(sh => sh.toLowerCase() === shape.toLowerCase()));
@@ -230,7 +127,7 @@ app.get('/api/diamonds', (req, res) => {
   const { setting_id, stone_type, shape } = req.query;
   const sType = (stone_type && stone_type !== 'undefined') ? stone_type : 'Natural';
 
-  const setting = rawSettings.find(s => s.id == setting_id) || rawSettings[0];
+  const setting = settingsResults.find(s => s.id == setting_id) || settingsResults[0];
   const targetShapes = setting ? setting.compatibleShapes : ['round'];
   const selShape = (shape && targetShapes.includes(shape.toLowerCase())) ? shape.toLowerCase() : (targetShapes[0] || 'round');
 
@@ -260,5 +157,4 @@ app.get('/api/diamonds', (req, res) => {
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`Mock Supplier API running on port ${PORT}`);
-  console.log(`Image cache directory: ${CACHE_DIR}`);
 });
