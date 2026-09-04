@@ -21,6 +21,7 @@ const rawData = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
 function getMetalString(metal, color) {
   const c = (color || '').toLowerCase();
   const m = (metal || '').toLowerCase();
+  if (m.includes('platinum') || c.includes('platinum')) return null;
   if (m.includes('14k') || m.includes('14kt') || m.includes('14 karat')) {
     if (c.includes('white')) return '14k White Gold';
     if (c.includes('yellow')) return '14k Yellow Gold';
@@ -33,7 +34,6 @@ function getMetalString(metal, color) {
     if (c.includes('rose') || c.includes('pink')) return '18k Rose Gold';
     return '18k White Gold';
   }
-  if (m.includes('platinum') || c.includes('platinum')) return 'Platinum';
   if (c.includes('white')) return '14k White Gold';
   if (c.includes('yellow')) return '14k Yellow Gold';
   if (c.includes('rose') || c.includes('pink')) return '14k Rose Gold';
@@ -66,6 +66,7 @@ if (rawData.ring_groups) {
     const metalMap = {};
     for (const r of rings) {
       const metalStr = getMetalString(r.metal, r.color);
+      if (!metalStr) continue;
       if (!metalMap[metalStr]) {
         metalMap[metalStr] = {
           metal: metalStr,
